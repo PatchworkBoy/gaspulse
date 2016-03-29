@@ -1,0 +1,166 @@
+#!/usr/bin/python
+#
+# Count gas meter revs per 5 minutes, convert to watts and kWh
+#
+# 1) Number of units used (n)
+# 2) Multiply by volume correction factor (Vc=1.022640)
+#       The correction factor is used to take account of the temperature
+#       and atmospheric conditions at a site. It is generally of the order
+#       of 1.02264, so we have defaulted to this
+# 3) Multiply by calorific value (CV=39.3)
+#       The calorific value (CV) is a measurement of the amount of energy
+#       contained in the gas. CV is usually quoted in megajoules per cubic metre
+#       (MJ/m3). Gas delivered to your premises will have a CV of between
+#       37.5 MJ/m3 and 43.0 MJ/m3. This is continually measured by Transco
+#       for each Local Distribution Zone and passed to your gas supplier daily
+# 4) Divide by kWh conversion factor (3.6)
+#
+# 1 m3 gas is approx 10 kWh
+#
+# E(kWh) = n * Vc * CV / 3.6
+# P(W) = (1000 * E(kWh)) / t(hr) = (3600 * 1000 * E(kWh))) / t(s)
+# E(kWh) = P(W) * t(hr) / 1000
+#
+
+# Read more: http://www.ukpower.co.uk/home_energy/gas_meter_readings#ixzz3RXckREUQ
+#
+
+import RPi.GPIO as GPIO
+import os
+import requests
+import time
+import sys
+from time import sleep
+from datetime import datetime
+
+revs=0
+interval=300
+LOG_FILE = '/var/log/gas/gaspulse.log'
+DAY_LOG = '/var/log/gas/gasdaily.log'
+DAY_COUN = '/var/log/gas/daycount.log'
+LIFE_LOG = '/var/log/gas/lifetime.log'
+DOMOTICZ_URL = "http://user:password@127.0.0.1:8080"
+METER_IDX = "65" # Virtual Sensor 1 - Domoticz type: P1 Smart Meter - Gas Meter counter
+FLOW_IDX = "66" # Domoticz type: General kWh - Current usage in kWh (better method)
+FLOW2_IDX = "75" # Domoticz type: Usage Electric - Current usage (crap method)
+lifetime = 0
+
+global lasttime
+lasttime = time.time()
+
+if os.path.isfile(LIFE_LOG):
+        with open(LIFE_LOG, 'r') as l:
+                last = None
+                for line in (line for line in l if line.rstrip('\n')):
+                        last = line
+                lifetime=float(last)
+else:
+    lifetime=0
+startTime = time.time()
+lastDay = 0
+if os.path.isfile(DAY_COUN):
+        with open(DAY_COUN, 'r') as l:
+                last = None
+                for line in (line for line in l if line.rstrip('\n')):
+                        last = line
+                count=float(last)/100
+else:
+        count = 0.00
+
+# print a log message
+def printMsg(msg):
+    i = datetime.now()
+    print i.strftime('%Y/%m/%d %H:%M:%S') + ' ' + msg
+
+# triggered when the GPIO pin goes low (meter magnet comes around)
+def eventHandler(channel):
+    global revs
+    global count
+    global lifetime
+    global lastDay
+    global dayUnits
+    global lasttime
+    global startTime
+    t1 = time.time()
+    if t1-lasttime>0.5: #software deBounce at 0.5 seconds
+        lasttime=time.time()
+        printMsg("Gas Pulse detected on GPIO " + str(channel))
+        revs = revs + 1
+        count = count + 0.01
+        lifetime = lifetime + 0.01
+        f = open(LIFE_LOG, 'a')
+        f.write (str(lifetime)+"\n")
+        f.close()
+        f = open(DAY_COUN, 'a')
+        f.write (str(count*100)+"\n")
+        f.close()
+        t0 = time.time()
+if t0-startTime >= 86400:
+            lastDay = count * 100
+            dayUnits = lastDay / 100
+            daypower= (((dayUnits*1.022640)*39.3) / 3.6)*1000
+            #daypower = (((3700 * 1000) * (dayUnits * 1.022640))/(t0-startTime))/1000
+            f = open(DAY_LOG,'a')
+            f.write ("Last Day: "+str(format(lastDay,'.2f'))+ " litres\n")
+            f.write ("Day Units: "+str(format(dayUnits,'.2f'))+ " units\n")
+            f.write ("Day Power: "+str(format(daypower,'.2f'))+ " \n")
+            f.write ("Revs: " + str(revs) +"  Count: " + str(count) + "  Lifetime: " + str(lifetime))
+            f.write (DOMOTICZ_URL+"/json.htm?type=command&param=udevice&idx="+FLOW_IDX+"&nvalue=0&svalue=0;"+str(format(daypower, '.2f'))+"\n")
+            f.close()
+            url1= DOMOTICZ_URL+"/json.htm?type=command&param=udevice&idx="+FLOW_IDX+"&nvalue=0&svalue=0;"+str(format(daypower, '.2f'))
+            u = requests.get(url1)
+            count = 0
+            startTime = time.time()
+            f = open(DAY_COUN, 'w')
+            f.write (str(0)+"\n")
+            f.close()
+        else:
+            printMsg("Not time for daily log")
+    else:
+        printMsg("Debouncing...")
+
+# log the kWh consumed in the last interval
+def logConsumption():
+    global lifetime
+    global lastDay
+    dayUnits = count / 100.0
+    units = revs / 100.0        # units consumed in interval, 1 rev = 0.01m3
+    VC=1.022640                   # Volume correction factor
+    power = (((units * VC)*39.3)/3.6)*1000       # Power (W) consumed in interval
+    daypower = (((dayUnits * VC)*39.3)/3.6)*1000
+    domlife = lifetime*1000
+    printMsg("log " + str(power/1000) + " kWh : " + str(format(daypower)) + " : " + str(domlife) + "\n")
+    f = open(LOG_FILE,'a')
+    f.write("Power: " + str(power) + " DayPower: " + str(daypower) + " Domlife: " + str(domlife) + "\n")
+    f.write("Revs: " + str(revs) + " lifetime: " + str(lifetime) + " lastDay: " + str(lastDay) + "\n")
+    f.write("dayUnits: " + str(dayUnits) + " Units: " + str(units) + "\n")
+    f.close()
+    url= DOMOTICZ_URL+"/json.htm?type=command&param=udevice&idx="+METER_IDX+"&nvalue=0&svalue="+str(domlife)
+    r = requests.get(url)
+    url2 = DOMOTICZ_URL+"/json.htm?type=command&param=udevice&idx="+FLOW_IDX+"&nvalue=0&svalue="+str(format(power, '.2f'))+";"+str(format(daypower, '.2f'))
+    s = requests.get(url2)
+    url3 = DOMOTICZ_URL+"/json.htm?type=command&param=udevice&idx="+FLOW2_IDX"+&nvalue=0&svalue="+str(format(power, '.2f'))
+    v = requests.get(url3)
+
+def main():
+    global revs                 # revs counted in the current interval
+    GAS_SENSOR = 7
+    GPIO.setmode(GPIO.BCM)
+
+    # Pull the pin up to stop false signals
+    GPIO.setup(GAS_SENSOR, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+    GPIO.add_event_detect(GAS_SENSOR, GPIO.FALLING)
+    GPIO.add_event_callback(GAS_SENSOR, eventHandler)
+
+    try:
+        while True:            # this will carry on until you hit CTRL+C
+            revs = 0
+            sleep(interval)
+            printMsg("Detected " + str(revs) + " revs in the last " + str(interval) + " seconds")
+            logConsumption()
+    except KeyboardInterrupt:
+        GPIO.cleanup()       # clean up GPIO on CTRL+C exit
+
+main()
+
